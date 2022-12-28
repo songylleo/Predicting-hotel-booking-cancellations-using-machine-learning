@@ -1,0 +1,906 @@
+---
+output: html_notebook
+---
+```{r}
+library(dplyr)
+library(glmnet)
+library(GGally)
+install.packages("kableExtra")
+install.packages("devtools")
+library(kableExtra)
+library(ggplot2)
+library(tidyverse)
+library(caret)
+```
+
+```{r}
+#Creating Tables for variables
+df = read.csv("hotel_bookings.csv") #load the raw data (32 variables)
+
+df_n<- data.frame(
+  No=c(1:14),
+  Feature=c("hotel","arrival_date_month","meal","country","market_segment",
+            "distribution_channel","reserved_room_type","assigned_room_type",
+            "deposit_type","agent","company","customer_type","reservation_status",
+            "reservation_status_date"),
+  Description=c("Type of hotel; City Hotel / Resort Hotel",
+                "Month of arrival date",
+                "Customers' meal type",
+                "Country of origin",
+                "Market segment designation",
+                "Booking distribution channel",
+                "Room type reserved",
+                "Room type assigned",
+                "Whether a deposit was made or not",
+                "Travel agency ID that made the booking",
+                "Company ID that made the booking",
+                "Whether the booking was part of a group or not",
+                "Whether customers checked out / No show / Canceled",
+                "Date at which the last status was set"))
+
+
+kbl(df_n, caption="Summary of Factor Variables") %>%
+  kable_classic_2(full_width=F) %>%
+  column_spec(1, bold=TRUE) %>%
+  column_spec(2, italic=TRUE) %>%
+  column_spec(3, width="28em") 
+
+
+df_n<- data.frame(
+  No=c(15:31),
+  Feature=c("is_canceled","lead_time", "arrival_date_year","arrival_date_week_number",
+            "arrival_date_day_of_month","stays_in_weekend_nights","stays_in_week_nights",
+            "adults","children","babies","is_repeated_guest","previous_cancellations",
+            "previous_bookings_not_cancelled","booking_changes","days_in_waiting_list",
+            "required_car_parking_spaces","total_of_special_requests"),
+  Description=c("Indicator of booking cancellations (1) or not (0)",
+                "No. days between booking date and arrival date",
+                "Year of arrival",
+                "Week number of arrival date",
+                "Day of the month of arrival",
+                "No. weekend nights guest stayed or booked to stay at hotel",
+                "No. weekday nights guest stayed or booked to stay at hotel",
+                "No. adults",
+                "No. children",
+                "No. babies",
+                "Indicator of repeated guest (1) or not (0)",
+                "No. previous booking cancellations made",
+                "No. previous bookings not cancelled",
+                "No. changes made to booking",
+                "No. days booking was in waiting list before confirmation",
+                "No. car parking spaces required by customer",
+                "No. special requests made by customer (e.g. twin bed or high floor)"))
+
+kbl(df_n, caption="Summary of Integer Variables") %>%
+  kable_classic_2(full_width=F) %>%
+  column_spec(1, bold=TRUE) %>%
+  column_spec(2, italic=TRUE) %>%
+  column_spec(3, width="28em") 
+
+
+df_n<- data.frame(
+  No=c(32),
+  Feature=c("adr"),
+  Description=c("Average Daily Rate; calculated by dividing sum of all lodging
+                transactions by the total no. of staying nights"))
+
+kbl(df_n, caption="Summary of Numeric Variable") %>%
+  kable_classic_2(full_width=F) %>%
+  column_spec(1, bold=TRUE) %>%
+  column_spec(2, italic=TRUE) %>%
+  column_spec(3, width="28em") 
+```
+
+```{r}
+df[, 1:32][df[, 1:32] == "NULL"] <- 0
+df[, 1:32][df[, 1:32] == "NA"] <- 0 #Replace "NULL" and "NA" entries with "0"
+df[is.na(df)]<-0
+
+bookings = df
+cat("Dimensions of Original Dataset are" , dim(bookings), "\n")
+```
+```{r}
+
+bookings<-bookings %>% filter(children>0 | adults>0 | babies>0)
+
+#Exclude "non-existing" customers
+#Further remove rows with all entries "NA"
+
+cat("Updated Dimensions of Dataset are" , dim(bookings), "\n")
+```
+
+EDA:
+```{r map plot library preparation}
+# install.packages(c("cowplot", "googleway", "ggplot2", "ggrepel", "ggspatial", "libwgeom", "sf", "rnaturalearth", "rnaturalearthdata")) #install all the packages you need for map plot
+
+#load all packages installed
+library(ggplot2)
+theme_set(theme_bw())
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+```
+
+
+```{r map plot}
+world <- ne_countries(scale = "medium", returnclass = "sf")#load the world dataset
+temp = filter(bookings, is_canceled == 0) #consider only the uncanceled cases
+temp <- temp %>% mutate(no.customer = adults + children + babies) #create a new colum that contains the total number of adults + children + babies
+temp = temp %>% select(country, no.customer) #select only country and no.of customers
+
+x = aggregate(temp$no.customer, list(temp$country), FUN=sum)#group by country the sum of no. of customers
+# x = data.frame(table(temp$country)) #count the country occurence and make it a dataframe
+names(x) = c("gu_a3","no.customer") #rename the dataframe for merging
+y = merge(world,x,by = "gu_a3",all = T) #merge the dataframe with the world dataset
+y$no.customer = coalesce(y$no.customer,0) #replace NA by 0
+ggplot(data = y) +
+    geom_sf(aes(fill = no.customer)) +
+    scale_fill_viridis_c(option = "rocket",direction = -1) #plot the country occurence
+```
+
+```{r}
+#Proportion of Canceled vs Not Canceled for each hotel:
+B<-bookings%>%mutate(is_canceled =factor(is_canceled, labels=c("Not canceled", "Canceled")),
+       hotel=factor(hotel))
+
+ggplot(data=B, aes(x=hotel, fill=is_canceled))+
+  geom_bar(position="fill")
+```
+
+```{r}
+#find out the most busy month
+library(dplyr)
+resort_data<-bookings%>%filter(bookings$hotel=='Resort Hotel'& bookings$is_canceled==0)
+resort_summary<-resort_data%>%group_by(arrival_date_month)%>%dplyr::summarize(resort_count=n())
+
+city_data<-bookings%>%filter(bookings$hotel=='City Hotel'& bookings$is_canceled==0)
+city_summary<-city_data%>%group_by(arrival_date_month)%>%dplyr::summarize(city_count=n())
+
+total_summary<-merge(resort_summary,city_summary)
+library(reshape)
+mydata<-melt(total_summary,id='arrival_date_month')
+mydata$arrival_date_month<-factor(mydata$arrival_date_month,levels=month.name)
+library(ggplot2)
+mydata<-mydata%>%arrange(arrival_date_month)
+ggplot(data=mydata,aes(x=arrival_date_month,y=value,group=variable,color=variable,shape=variable))+geom_point()+geom_line()+xlab("Month")+ylab("Counts")
+
+```
+
+```{r}
+#How does the price vary per night over the year
+resort_price<-resort_data%>%group_by(arrival_date_month)%>%summarise(resort_price=mean(adr))
+city_price<-city_data%>%group_by(arrival_date_month)%>%summarise(city_price=mean(adr))
+
+price_summary<-merge(resort_price,city_price)
+
+pricedata<-melt(price_summary,id='arrival_date_month')
+pricedata$arrival_date_month<-factor(pricedata$arrival_date_month,levels=month.name)
+
+pricedata<-pricedata%>%arrange(arrival_date_month)
+ggplot(data=pricedata,aes(x=arrival_date_month,y=value,group=variable,color=variable,shape=variable))+geom_point()+geom_line()+xlab("Month")+ylab("Price")
+```
+
+
+```{R}
+###How long do people stay at hotels
+library(dplyr)
+stay=bookings%>%filter(is_canceled==1)
+head(stay)
+
+stay$total_nights=paste(stay$stays_in_weekend_nights+stay$stays_in_week_nights)
+stay1=stay %>% group_by(total_nights, hotel)%>%tally()
+stay1=stay1%>%rename("Numberofstays"=="n")
+
+stay1=transform(stay1, total_nights=as.integer(total_nights))
+stay1
+```
+```{r}
+colnames(stay1)
+library(ggplot2)
+ggplot(stay1, aes(x=total_nights, y=n, color=hotel)) + 
+  geom_bar(stat = "identity")
+```
+
+
+DATA CLEANING:
+
+```{r data pre processing}
+useless_col = c('reservation_status','arrival_date_year',
+                'agent', 'company','country')
+
+
+bookings1 = bookings %>% select(-useless_col)
+dim(bookings1)
+
+cat("Dimensions of the cleaned data are", dim(bookings1))
+```
+
+```{r}
+summary(bookings1)
+```
+```{r}
+str(bookings1)
+
+```
+
+```{r data pre processing categorical variables}
+# encoding categorical variables
+bookings1 = bookings1 %>% 
+  dplyr::mutate( 
+                reservation_month = lubridate::month(reservation_status_date), 
+                reservation_day = lubridate::day(reservation_status_date))
+bookings1= bookings1 %>%select(-c("reservation_status_date"))
+dim(bookings1)
+
+bookings1$reservation_month<- as.factor(bookings1$reservation_month)
+# creating numerical and categorical dataframes
+
+bookings1.chr = bookings1[, sapply(bookings1, class) == 'character']
+bookings1.num = bookings1[, sapply(bookings1, class) != 'character']
+bookings1.fac<- as.data.frame(unclass(bookings1.chr),stringsAsFactors = TRUE) %>% 
+  mutate(reservation_month=bookings1$reservation_month)
+bookings1.num<- bookings1.num %>% select(-"reservation_month")
+
+
+levels(bookings1.fac$arrival_date_month)<- c("January","February","March","April","May","June","July",
+                 "August","September","October","November","December")
+levels(bookings1.fac$reservation_month)<- c("January","February","March","April","May","June","July",
+                 "August","September","October","November","December")
+str(bookings1.fac)
+summary(bookings1.fac)
+str(bookings1.num)
+```
+
+
+
+
+```{r data pre processing numerical variables}
+bookings1.num = bookings1.num %>% select(-is_canceled)
+data.frame(sapply(bookings1.num,var))
+
+#log normalize columns which have high variance
+bookings1.normalized.num = bookings1.num
+large.variance.columns = c('lead_time', 'days_in_waiting_list','adr')
+
+for (i in 1:3) {
+  bookings1.normalized.num[large.variance.columns[i]] = log(bookings1.num[large.variance.columns[i]]+1)
+}
+
+data.frame(sapply(bookings1.normalized.num,var))
+
+summary(bookings1.normalized.num$adr)
+bookings1.normalized.num$adr[is.na(bookings1.normalized.num$adr)]<-mean(bookings1.normalized.num$adr,na.rm=TRUE) #fill the NA with the mean of the column
+```
+
+
+```{r data pre processing combining categorical and numerical variables and predictor variable to get rawdata}
+# combine the categorical and numerical variables and "country" column
+
+x = cbind(bookings1.fac,bookings1.normalized.num)
+y = select(bookings1,is_canceled)
+# combine the predictor variable and the response variable
+rawdata = cbind(y,x)
+dim(rawdata)
+head(rawdata)
+summary(rawdata)
+
+```
+
+
+```{r CORR PLOT}
+
+A= rawdata 
+
+
+A%>% dplyr::rename(cancel=is_canceled, lead=lead_time, week_arr= arrival_date_week_number,
+                   day_arr = arrival_date_day_of_month , wkend=stays_in_weekend_nights,week=stays_in_week_nights,
+                   rep=is_repeated_guest,prev_can=previous_cancellations,
+                   prev_not=previous_bookings_not_canceled, change=booking_changes,
+                   wait=days_in_waiting_list,car_park=required_car_parking_spaces,
+                   req=total_of_special_requests, day_res= reservation_day ) %>%
+  ggcorr(palette="RdBu", label= TRUE, label_size=3,label_alpha= TRUE,
+         hjust=0.75, size=3, color="grey50", layout.exp=10)
+
+```
+
+```{r PCA}
+auto_pca=rawdata%>%
+  select_if(is.numeric)%>%
+  prcomp(scale=TRUE)
+
+auto_pca$rotation%>%round(3)
+
+#Plot with Loadings
+library(ggfortify)
+autoplot(auto_pca, loadings=TRUE, loadings.colour="blue",
+         loadings.label=TRUE, loadings.label.size=3)
+
+
+auto_pca$x%>%
+  as_tibble%>%
+  head
+
+auto_pca$x%>%
+  cor%>%
+  round(3)
+
+auto_pca$sdev%>%round(3)
+
+auto_pca$sdev^2%>%round(3)
+
+auto_pca$x%>%
+  cov%>%
+  round(3)
+
+
+var_exp <- tibble(pc = paste("PC", 1:18, sep = ""),
+                  variance=auto_pca$sdev^2)%>%
+  mutate('Variance Explained'=variance/sum(variance))%>%
+  mutate('Cumulative Variance Explained'=cumsum(variance/sum(variance)))
+
+#Scree Plot of Variances
+var_exp%>%
+  pivot_longer('Variance Explained': 'Cumulative Variance Explained')%>%
+  ggplot(aes(pc, value, group=name))+
+  geom_point()+
+  geom_line()+
+  facet_wrap(~name, scales="free_y")+
+  theme_bw()+
+  lims(y=c(0,1))+
+  labs(y="Variance",
+       title="Variance explained by each principal component")
+
+auto_pca$x%>%
+  as_tibble()%>%
+  cbind(rawdata)%>%
+  ggplot(aes(x=PC1, y=PC2, color=reserved_room_type))+
+  geom_point()
+
+auto_pca$x%>%
+  as_tibble()%>%
+  cbind(rawdata)%>%
+  ggplot(aes(x=PC1, y=PC2, color=meal))+
+  geom_point()
+
+auto_pca$x%>%
+  as_tibble()%>%
+  cbind(rawdata)%>%
+  ggplot(aes(x=PC1, y=PC2, color=deposit_type))+
+  geom_point()
+
+auto_kclust=rawdata%>%
+  select_if(is.numeric)%>%
+  kmeans(7)
+
+
+auto_kclust
+
+table(rawdata$reserved_room_type, auto_kclust$cluster)
+
+auto_pca$x%>%
+  as_tibble%>%
+  mutate(cluster=auto_kclust$cluster)%>%
+  mutate(cluster=as.character(cluster))%>%
+  ggplot(aes(x=PC1, y=PC2, group=cluster, color=cluster))+
+  geom_point()
+
+#normalizing the data
+auto_kclust=rawdata%>%
+  select_if(is.numeric)%>%
+  scale%>%
+  kmeans(7)
+
+auto_pca$x%>%
+  as_tibble%>%
+  mutate(cluster=auto_kclust$cluster)%>%
+  mutate(cluster=as.character(cluster))%>%
+  ggplot(aes(x=PC1, y=PC2, group=cluster, color=cluster))+
+  geom_point()
+```
+
+```{r}
+# splitting data into training set and test set
+set.seed(1000)
+idx = sample(nrow(rawdata), nrow(rawdata)*0.7)
+train_data<-rawdata[idx,]
+test_data<-rawdata[-idx,]
+head(train_data)
+dim(train_data)
+dim(test_data)
+
+```
+
+
+```{r}
+#Logistic Regression
+library(ROCR)
+library(plotROC)
+
+rawdata$is_canceled<- factor(rawdata$is_canceled)
+str(rawdata)
+set.seed(4510)
+
+idx = sample(nrow(rawdata), nrow(rawdata)*0.7)
+train_data<-rawdata[idx,]
+test_data<-rawdata[-idx,]
+head(train_data)
+dim(train_data)
+dim(test_data)
+
+```
+
+```{r}
+mod_log<-train(is_canceled~., data=train_data, method="glm",
+               family = "binomial", trControl=trainControl("cv", number=5))
+summary(mod_log)
+```
+```{r}
+#Prediction on test data
+raw_preds<- predict(mod_log, test_data, type = "prob")
+head(raw_preds)
+raw_preds<-raw_preds[,2]
+head(raw_preds)
+
+#"1" means canceled, "0" means not canceled
+
+pred_labels<- ifelse(raw_preds >0.5, "Canceled", "Not Canceled") %>% as.factor
+test_labels<- ifelse(test_data$is_canceled == "1","Canceled", "Not Canceled") %>% as.factor
+cm<-confusionMatrix(pred_labels, test_labels)
+cm
+```
+
+
+```{r Performanace Evaluation}
+
+#Accuracy
+accuracy = cm$overall['Accuracy']
+#test_error
+test_error = unname(1-cm$overall['Accuracy'])
+#cv-error
+cv_error = 1-mod_log$results$Accuracy
+
+
+c(CV = cv_error, TEST= test_error, accuracy)
+```
+
+```{r}
+coef(mod_log$finalModel, ncol=5)
+```
+
+```{r}
+#ROC and Threshold
+
+df<-data.frame(
+  predictions= raw_preds,
+  labels = 0 +(test_data$is_canceled == 1)
+)
+
+ggplot(df, aes(m=predictions, d=labels)) +
+  geom_roc(n.cuts=10, labels= TRUE) +
+  style_roc(theme = theme_grey) +
+  coord_fixed()
+```
+
+
+```{r}
+pred_obj<- prediction(raw_preds, 0+(test_data$is_canceled == 1))
+auc_ROCR<- performance(pred_obj, measure="auc")
+auc_ROCR@y.values[[1]]
+```
+
+```{r}
+#Regularization- Elastic Net
+elastic_net<- train(
+  is_canceled~., data= train_data, method="glmnet",
+  tuneGrid = expand.grid(alpha=seq(from=0, to=1, length=5),
+                         lambda=10^(seq(from= -2, to= 2, length= 5))),
+  trControl= trainControl("cv", number=5), preProcess = c("scale")
+)
+
+elastic_net
+elastic_net$bestTune
+coef(elastic_net$finalModel, elastic_net$bestTune$lambda)
+```
+
+```{r}
+test_confusion_en<- elastic_net %>%
+  predict(test_data) %>% confusionMatrix(test_data$is_canceled)
+test_confusion_en
+
+en_test_err<- unname(1-test_confusion_en$overall['Accuracy'])
+en_accuracy<- test_confusion_en$overall['Accuracy']
+
+```
+
+
+
+```{r LASSO}
+#Regularization- LASSO
+
+lambda = 10^seq(-3, 0, length=10)
+lasso<- train(is_canceled~., train_data, method="glmnet",
+              trControl = trainControl("cv", number = 5),
+              tuneGrid = expand.grid(alpha=1, lambda=lambda),
+              preProcess = c("scale"))
+lasso
+lasso$bestTune
+coef(lasso$finalModel, lasso$bestTune$lambda)
+```
+
+```{r}
+test_confusion_lasso<- lasso %>%
+  predict(test_data) %>% confusionMatrix(test_data$is_canceled)
+test_confusion_lasso
+lasso_test_err<- unname(1-test_confusion_lasso$overall['Accuracy'])
+lasso_accuracy<- test_confusion_lasso$overall['Accuracy']
+lasso_accuracy
+lasso_test_err
+```
+
+
+
+```{r}
+#Regularization- Ridge (for ALASSO)
+require(glmnet)
+x<- data.matrix(train_data[,-1])
+y<- as.double(data.matrix(train_data[,1]))
+
+set.seed(4510)
+cv.ridge<- cv.glmnet(x, y, family='binomial', alpha=0, parallel=TRUE, 
+                     nfold=5, standardize= TRUE)
+
+cv.ridge
+coef(cv.ridge, cv.ridge$lambda.min)
+```
+
+```{r}
+#Regularization- ALASSO
+require(glmnet)
+x<- data.matrix(train_data[,-1])
+y<- as.double((data.matrix(train_data[,1])))
+
+
+w= 1/abs(matrix(coef(cv.ridge, s=cv.ridge$lambda.min)
+[,1][2:(ncol(x)+1)]))^1
+w[w[,1]==Inf]<- 999999999
+
+set.seed(4510)
+
+cv.alasso<-cv.glmnet(x,y, family="binomial", alpha=1, parallel=TRUE, nfold=5,
+                     standardize=TRUE, penalty.factor=w
+                     )
+
+cv.alasso
+coef(cv.alasso, cv.alasso$lambda.min)
+```
+
+```{r}
+x_test<- data.matrix(test_data[,-1])
+y_test<- as.double((data.matrix(test_data[,1])))
+
+test_confusion_alasso<- as.factor(predict(cv.alasso, x_test, type="class", cv.alasso$lambda.min)) %>%
+  confusionMatrix(test_data$is_canceled)
+test_confusion_alasso
+
+alasso_test_err<- unname(1-test_confusion_alasso$overall['Accuracy'])
+alasso_accuracy<- test_confusion_alasso$overall['Accuracy']
+alasso_accuracy
+
+```
+
+
+```{r}
+#data for tree models
+train.data=train_data
+test.data=test_data
+char_col=names(bookings1.chr)
+train.data[char_col]<-sapply(train.data[char_col],as.numeric)
+test.data[char_col]<-sapply(test.data[char_col],as.numeric)
+```
+
+```{r}
+#Decision Tree
+library(rpart)
+library(rpart.plot)
+library(caret)
+set.seed(4510)
+train.data<-train.data%>%mutate(is_canceled=factor(is_canceled))
+test.data<-test.data%>%mutate(is_canceled=factor(is_canceled))
+fit <- rpart(is_canceled ~ ., data = train.data)
+rpart.plot(fit)
+
+cm_tree<-fit%>%predict(test.data, type='class')%>%confusionMatrix(test.data$is_canceled)
+
+cm_tree$overall['Accuracy']
+
+
+#Tune the hyper-parameter
+plotcp(fit)
+fit$cptable
+opt_cp <- fit$cptable[which.min(fit$cptable[ , 'xerror']) , 'CP']
+opt_cp
+mod_tree_pruned <- prune.rpart(fit, opt_cp)
+cm_modtree<-mod_tree_pruned%>%predict( test.data, type='class')%>%confusionMatrix(test.data$is_canceled)
+
+cm_modtree$overall['Accuracy']
+varImp(mod_tree_pruned) %>%
+  arrange(-Overall) %>%
+  head(n = 10)
+```
+
+```{r}
+library(dplyr)
+set.seed(4510)
+ind <- sample(1:nrow(train.data), size = 500, replace = FALSE)
+mini_data <- train.data[ind,]
+
+rfGrid <- expand.grid(mtry = c(8, 10, 15, 25), 
+                      min.node.size = c(3, 5, 10, 20),
+                      splitrule = "gini")
+
+mod_rf_tune <- train(is_canceled ~ . , data = mini_data, method = "ranger",
+                num.trees = 500,
+                importance = 'impurity',
+                tuneGrid = rfGrid,
+                trControl = trainControl("oob"))
+mod_rf_tune
+
+mod_rf_tuned <- train(is_canceled ~ . , data = train.data, method = "ranger",
+                num.trees = 500,
+                importance = 'impurity',
+                tuneGrid = expand.grid(mod_rf_tune$bestTune),
+                trControl = trainControl("oob"))
+
+cm_rf <- mod_rf_tuned %>%
+  predict(test.data, type = "raw") %>%
+  confusionMatrix(test.data$is_canceled)
+
+cm_rf$overall['Accuracy']
+plot(varImp(mod_rf_tuned), top = 10)
+
+cm_rf
+```
+
+```{r}
+#Adaboost
+set.seed(4510)
+library(adabag)
+train.data$is_canceled=as.factor(train.data$is_canceled)
+test.data$is_canceled=as.factor(test.data$is_canceled)
+start_time<-Sys.time()
+adamodel<-boosting(is_canceled~.,data=train.data,boos=TRUE,mfinal=100)
+pre_decisiontree_ada <- predict(adamodel,newdata = test.data)$class
+accu_table<-table(test.data$is_canceled,pre_decisiontree_ada)
+accuracy<-sum(diag(accu_table))/sum(accu_table)
+end_time<-Sys.time()
+time_used<-end_time-start_time
+ada_tb<-data.frame('mfinal'=100,
+                   'accuracy'=accuracy,
+                   'Time in min'=time_used)
+ada_tb
+```
+
+```{r}
+#The following r code is for finding the best mfinal value
+#set.seed(4510)
+#mf<-c(10,30,50,100)
+#acc<-c(0,0,0,0)
+#time<-c(0,0,0,0)
+
+#for (iteration in c(1,2,3,4)){
+#  start_time<-Sys.time()
+#    adamodel<-boosting(is_canceled~.,data=train.data,boos     =TRUE,mfinal=mf[iteration])
+# pre_decisiontree_ada <- predict(adamodel,newdata =   test.data)$class
+#  accu_table<-table(test.data$is_canceled,pre_decisiontree_ada)
+#  accuracy<-sum(diag(accu_table))/sum(accu_table)
+#  end_time<-Sys.time()
+#  time_used<-end_time-start_time
+#  acc[iteration]<-accuracy
+#  time[iteration]<-time_used
+
+#}
+
+#ada_tb<-data.frame('mfinal'=mf,
+#                   'accuracy'=acc,
+#                  'Time in min'=time)
+#ada_tb
+```
+
+```{r}
+#XGBOOST
+library(xgboost)
+library(caret)
+library(Matrix)
+train.data$is_canceled=as.numeric(as.character(train.data$is_canceled))
+test.data$is_canceled=as.numeric(as.character(test.data$is_canceled))
+#loading labels of train data
+train_matrix <- sparse.model.matrix(is_canceled ~ .-1, data = train.data)
+test_matrix <- sparse.model.matrix(is_canceled ~ .-1, data = test.data)
+
+train_fin <- list(data=train_matrix,label=train.data$is_canceled) 
+test_fin <- list(data=test_matrix,label=test.data$is_canceled) 
+dtrain <- xgb.DMatrix(data = train_fin$data, label = train_fin$label) 
+dtest <- xgb.DMatrix(data = test_fin$data, label = test_fin$label)
+xgb <- xgboost(data = dtrain,max_depth=6, eta=0.3,  
+  objective='binary:logistic', nround=100)
+importance <- xgb.importance(train_matrix@Dimnames[[2]], model = xgb)  
+head(importance)
+xgb.ggplot.importance(importance)
+pre_xgb = round(predict(xgb,newdata = dtest))
+xgb.cf<-caret::confusionMatrix(as.factor(pre_xgb),as.factor(test.data$is_canceled))
+xgb.cf$overall['Accuracy']
+table(test.data$is_canceled,pre_xgb,dnn=c("true","pre"))
+```
+
+```{r ANN model}
+library(keras)
+
+rawdata1 <- mutate_all(rawdata, function(x) as.numeric(x))
+
+set.seed(102)
+idx = sample(nrow(rawdata1), nrow(rawdata1)*0.7)
+train.data<-rawdata1[idx,]
+test.data<-rawdata1[-idx,]
+
+train.data.x = train.data %>% select(-is_canceled) %>% as.matrix()
+train.data.y = train.data %>% select(is_canceled) %>% as.matrix() %>% to_categorical()
+test.data.x = test.data %>% select(-is_canceled) %>% as.matrix()
+test.data.y = test.data %>% select(is_canceled) %>% as.matrix() %>% to_categorical()
+
+mod_ann <- keras_model_sequential() %>%
+  layer_dense(input_shape = ncol(train.data.x), units = 50, activation = 'relu',
+              kernel_regularizer = regularizer_l1(0.001)) %>%
+  layer_dropout(rate = 0.01) %>%
+  layer_dense(units = 50, activation = 'relu') %>%
+  layer_dense(units = 2, activation = 'sigmoid')
+
+mod_ann %>% compile(
+  optimizer = 'adam',
+  loss = 'binary_crossentropy',
+  metrics = c('acc')
+)
+
+summary(mod_ann)
+
+temp = mod_ann %>% fit(train.data.x, train.data.y, epochs = 20, verbose = 2,
+              validation_data = list(test.data.x,test.data.y))
+
+save_model_hdf5(mod_ann, "mod_ann.h5")
+
+plot(temp)
+
+pred <- mod_ann %>% predict(test.data.x, batch_size = 128)
+Y_pred = round(pred)
+CM = table(Y_pred, test.data.y)
+sensitivity(CM)
+specificity(CM)
+
+# hypeytuning is done by two other R file: "trial1.R" & "trial2.R", the code is pasted in the following two chunks
+```
+
+
+```{r ANN model hyper tuning first file "trial1.R"}
+# library(keras)
+# library(kerastuneR)
+# 
+# rawdata1 <- mutate_all(rawdata, function(x) as.numeric(x))
+# 
+# set.seed(102)
+# idx = sample(nrow(rawdata1), nrow(rawdata1)*0.7)
+# train.data<-rawdata1[idx,]
+# test.data<-rawdata1[-idx,]
+# 
+# train.data.x = train.data %>% select(-is_canceled) %>% as.matrix()
+# train.data.y = train.data %>% select(is_canceled) %>% as.matrix() %>% to_categorical()
+# test.data.x = test.data %>% select(-is_canceled) %>% as.matrix()
+# test.data.y = test.data %>% select(is_canceled) %>% as.matrix() %>% to_categorical()
+# 
+# FLAGS <- flags(
+#   flag_numeric('dropout1', 0.05),
+#   flag_integer('neurons1', 100),
+#   flag_integer('neurons2', 100),
+#   flag_numeric('l1', 0.01)
+# )
+# 
+# mod_ann <- keras_model_sequential() %>%
+#   layer_dense(input_shape = ncol(train.data.x), units = FLAGS$neurons1, activation = 'relu',
+#               kernel_regularizer = regularizer_l1(l=FLAGS$l1)) %>%
+#   layer_dropout(FLAGS$dropout1) %>%
+#   layer_dense(units = FLAGS$neurons2, activation = 'relu') %>%
+#   layer_dense(units = 2, activation = 'sigmoid')
+# 
+# mod_ann %>% compile(
+#   optimizer = 'adam',
+#   loss = 'binary_crossentropy',
+#   metrics = 'accuracy'
+# )
+# epoch = 8
+# 
+# temp = mod_ann %>% fit(train.data.x, train.data.y, epochs = epoch, verbose = 2,
+#                        validation_data = list(test.data.x,test.data.y))
+# 
+# save_model_hdf5(mod_ann, 'mod_ann.h5')
+```
+
+```{r ANN model hyper tuning second file "trial2.R"}
+# par <- list(
+#   dropout1 = c(0.01,0.05,0.1,0.2),
+#   neurons1 = c(50,100,150),
+#   neurons2 = c(50,100,150),
+#   l1 = c(0.0001,0.001,0.01)
+# )
+# 
+# library(tfruns)
+# runs <- tuning_run('trial1.R', runs_dir = '_tuning', sample = 0.1, flags = par)
+# 
+# best_run <- ls_runs(order = metric_accuracy, decreasing= T, runs_dir = '_tuning')[1,]
+# 
+# best_run
+```
+
+
+```{R Naive Bias Classifer data cleanup}
+train_data$is_canceled=as.factor(train_data$is_canceled)
+test_data$is_canceled=as.factor(test_data$is_canceled)
+```
+
+```{R tuning hyperparameters}
+library(caret, quietly=TRUE)
+library(naivebayes)
+nb_grid=expand.grid(usekernel=c(TRUE, FALSE),
+                    laplace=c(0,0.5,1),
+                    adjust=c(1,2,3))
+
+set.seed(4510)
+nb1=train(is_canceled~.,data=train_data,
+          method="naive_bayes",
+          usepoisson=TRUE,
+          tuneGrid=nb_grid)
+
+
+```
+```{r}
+library(caret, quietly=TRUE)
+library(naivebayes)
+set.seed(4510)
+#Tuning Hyperparameters
+nb_grid=expand.grid(usekernel=c(TRUE, FALSE),
+                    laplace=c(0,0.5,1),
+                    adjust=c(0.75,1,1.25,1.5))
+
+nb1=train(is_canceled~.,data=train_data,
+          method="naive_bayes",
+          usepoisson=TRUE,
+          tuneGrid=nb_grid)
+nb1$finalModel$tuneValue
+
+nb1$results%>%
+    top_n(5, wt=Accuracy)%>%
+    arrange(desc(Accuracy))
+
+plot(nb1)
+
+```
+
+
+
+
+```{R Naive Bayes Classifier}
+set.seed(4510)
+library(naivebayes)
+attributes(modelnv)
+# Fitting Naive Bayes Model to training dataset
+modelnv=naive_bayes(is_canceled~., data=train_data, usekernel = FALSE, adjust=0.75)
+
+
+# Predicting on test data
+pred=predict(modelnv, test_data)
+plot(modelnv)
+table(pred,
+      test_data$is_canceled, dnn=c("Prediction", "Actual"))
+# Confusion Matrix
+confusionMatrix(pred, test_data$is_canceled)
+```
+
+
+
